@@ -53,12 +53,18 @@ inline double readTime(uintptr_t fn, uintptr_t obj, uintptr_t ctx) {
 
 // The water's own clock. The waves are drawn with it ("GetWaterTime: sync Time across various places in Water"), so
 // that is the clock the height model has to use; the world's GetTimeSeconds is the fallback.
+// 2026-11-15: this walked every object in the game -- and then every object again, because the class was not loaded
+// yet -- on the GAME thread, every frame. That froze the world (the clock never moved past a second, so the waves
+// stood still) and the game piled up memory while it was frozen. It is looked up once now, on the plugin's thread.
 inline uintptr_t waterSubsystem() {
-    if (!cSub) cSub = api->find_object("Class", "WaterSubsystem", "/Script/Water");
+    static bool tried;
+    if (tried) return waterSub;
+    tried = true;
+    cSub = api->find_object("Class", "WaterSubsystem", "/Script/Water");
     if (!cSub) return 0;
     for (int i = 0, n = api->num_objects(); i < n; i++) {
         uintptr_t o = api->object(i);
-        if (o && !isCDO(o) && api->is_a(classOf(o), cSub)) return o;
+        if (o && !isCDO(o) && api->is_a(classOf(o), cSub)) { waterSub = o; return o; }
     }
     return 0;
 }
@@ -99,6 +105,23 @@ inline void update(uintptr_t ctx) {
 //   Waves = "length cm:height cm, ..."   empty = the game's own set (6 waves, +-32 cm)
 //   Steepness = 0                          empty = the game's own; 0 = no sideways push, so the height at a point is
 //                                          exactly what the model computes
+inline uintptr_t cWaterBody, cWaveRef, cWaveAsset, cWaveGer, sWave, fCompLoc;
+inline bool classesTried;
+
+// Look the water classes up once, on the plugin's own thread (2026-11-15: a lookup walks every object in the game --
+// two seconds of it -- and doing that on the game thread froze the world: the waves stood still, the world clock
+// never moved past a second, and the game's memory piled up. Nothing here may run on the game thread.)
+inline void resolveClasses() {
+    if (classesTried) return;
+    cWaterBody = api->find_object("Class", "WaterBody", "/Script/Water");
+    cWaveRef = api->find_object("Class", "WaterWavesAssetReference", "/Script/Water");
+    cWaveAsset = api->find_object("Class", "WaterWavesAsset", "/Script/Water");
+    cWaveGer = api->find_object("Class", "GerstnerWaterWaves", "/Script/Water");
+    sWave = api->find_object("ScriptStruct", "GerstnerWave", "/Script/Water");
+    fCompLoc = api->find_object("Function", "GetComponentLocation", "SceneComponent");
+    classesTried = cWaterBody && cWaveRef && cWaveAsset && cWaveGer && sWave;
+}
+
 inline uintptr_t waveObj;  // the game's GerstnerWaterWaves object
 inline int oArr = -1, oVec = -1, oSpd = -1, oAmp = -1, oPh = -1, oLen = -1, oSteep = -1, oDir = -1, oWKA = -1, oQ = -1, stride = 0;
 
@@ -168,10 +191,8 @@ inline void applyProfile() {
 // on the collision surface and looked like it was floating on top of the water (2026-11-14). The mesh's own level is
 // the one to float on.
 inline double base = 0;          // the drawn sea's level; 0 = not known yet
-inline uintptr_t fCompLoc;
 
 inline bool compLocation(uintptr_t comp, double* v) {
-    if (!fCompLoc) fCompLoc = api->find_object("Function", "GetComponentLocation", "SceneComponent");
     if (!fCompLoc || !comp) return false;
     api->process_event(comp, fCompLoc, v);
     return true;
@@ -185,6 +206,7 @@ inline std::vector<int> foundMeshes;  // object indices, handed over from the pl
 // Find them: a component of the ocean (or of its zone) whose class is a water mesh.
 inline void scanSeaMeshes() {  // plugin thread
     std::vector<int> m;
+    resolveClasses();
     uintptr_t c1 = api->find_object("Class", "WaterBodyMeshComponent", "/Script/Water");
     uintptr_t c2 = api->find_object("Class", "WaterMeshComponent", "/Script/Water");
     if (!c1 && !c2) return;
@@ -202,11 +224,9 @@ inline void scanSeaMeshes() {  // plugin thread
 // read the wave list off an ocean body; true when it has one
 inline bool load(uintptr_t ocean) {
     list.clear();
-    uintptr_t cBody = api->find_object("Class", "WaterBody", "/Script/Water");
-    uintptr_t cRef = api->find_object("Class", "WaterWavesAssetReference", "/Script/Water");
-    uintptr_t cAsset = api->find_object("Class", "WaterWavesAsset", "/Script/Water");
-    uintptr_t cGer = api->find_object("Class", "GerstnerWaterWaves", "/Script/Water");
-    uintptr_t sWave = api->find_object("ScriptStruct", "GerstnerWave", "/Script/Water");
+    // The classes are found on the plugin's thread (resolveClasses). This runs on the game thread, where a lookup
+    // would walk every object in the game and freeze it.
+    uintptr_t cBody = cWaterBody, cRef = cWaveRef, cAsset = cWaveAsset, cGer = cWaveGer;
     if (!ocean || !cBody || !cRef || !cAsset || !cGer || !sWave) return false;
     uintptr_t w = get<uintptr_t>(ocean + off(cBody, "WaterWaves"));
     if (w && api->is_a(classOf(w), cRef)) w = get<uintptr_t>(w + off(cRef, "WaterWavesAsset"));

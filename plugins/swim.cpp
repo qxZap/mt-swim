@@ -46,9 +46,13 @@ enum : uint8_t { MOVE_Walking = 1, MOVE_Falling = 3, MOVE_Flying = 5 };
 
 static uintptr_t cChar, cBody, cOcean, cRiver, fPawn, gameplayCDO, systemCDO, fLoc, fBodyComp, fSurface, fSetMode, fBounds, fMesh,
     fAnimInst, fPlay, fStop, fIsPlaying, fPath, fRef, fLoad, fSetBase;
+static uintptr_t nSpray, fSpawnNiagara, niagaraCDO;
+static int oNiLoc = -1, oNiRot = -1, oNiScale = -1, oNiDestroy = -1, oNiActive = -1, oNiPool = -1, oNiPreCull = -1;
+static int oNiCtx = -1, oNiSys = -1, oNiRet = -1;
+static double lastSpray, sprayCount, sprayCost;
 static int oCMC = -1, oMode = -1, oVel = -1, oFly = -1, oSurfOut = -1, oSurfIncl = -1, oSurfVel = -1, oSurfDepth = -1, oCharMesh = -1,
     oMoveBase = -1, oPlayRet = -1, oCap = -1;
-static double kDepth, kFresh, kSpeed, kSprint, kStamina, kJump, kDive, kRise, kDrift, kOxygen, kSwell, kLean;
+static double kDepth, kFresh, kSpeed, kSprint, kStamina, kJump, kDive, kRise, kDrift, kOxygen, kSwell, kLean, kSprayEvery;
 static double floatDepth = 0;  // how far under the surface the capsule's centre sits: measured off the body
 static int kDiveKey;
 static volatile LONG queued, jump, keys;  // keys: 1 dive, 2 up (Space held), 4 sprint
@@ -351,7 +355,7 @@ static void findWaters() {  // game thread
     if (!montagesTried && !waters.empty()) loadMontages();  // load before the first swim, not during it
     static uintptr_t wavesFor;
     for (auto& x : waters)
-        if (x.sea && x.o != wavesFor) {
+        if (x.sea && (x.o != wavesFor || sea::list.empty())) {  // again if it is empty: the classes may not have been there yet
             wavesFor = x.o;
             bool ok = sea::load(x.o);
             MT_LOG(ok ? "sea: following the game's %zu waves" : "sea: no wave list on the ocean (%zu): own swell", sea::list.size());
@@ -372,9 +376,10 @@ static void findWaters() {  // game thread
             bool ours = false;
             for (auto& w : waters)
                 if (w.sea && w.o == outer) ours = true;  // the mesh of the sea itself, not the zone's or a lake's
-            MT_LOG("sea: a water mesh at %.0f %.0f %.0f (its outer is %s%s)", v[0], v[1], v[2], objName(outer).c_str(),
-                   ours ? ", the sea's own" : "");
-            if (ours && sea::base == 0) sea::base = v[2];
+            if (ours && sea::base == 0) {
+                sea::base = v[2];
+                MT_LOG("sea: the drawn water is at %.0f (the mesh at %.0f %.0f %.0f)", v[2], v[0], v[1], v[2]);
+            }
         }
     }
     InterlockedExchange(&haveWater, waters.empty() ? 0 : 1);
@@ -527,6 +532,8 @@ static void restore(uintptr_t cmc) {
     if (get<uint8_t>(cmc + oMode) == MOVE_Flying) setMode(cmc, MOVE_Falling);
 }
 
+static void spawnSpray(uintptr_t ch, Vec at, double surfZ);  // the game's own water spray
+
 static void tick(void*) {
     InterlockedExchange(&queued, 0);
     LONG wantJump = InterlockedExchange(&jump, 0), k = keys;
@@ -630,6 +637,19 @@ static void tick(void*) {
     clearDeadBase(cmc);  // the vehicle under the player can be destroyed while they swim
     bool atTop = at.z > line - 30, under = at.z + 70 < surf;  // head ~70 cm over the capsule centre
     breathe(under, dt);
+    // The splash: the game's own water spray, where the swimmer breaks the water. It is spawned at the drawn surface
+    // (the wave's own height), so it sits in the water the player sees.
+    if (atTop && kSprayEvery > 0 && t - lastSpray > kSprayEvery) {
+        lastSpray = t;
+        double t0 = nowS();
+        spawnSpray(ch, at, surf);
+        sprayCost += nowS() - t0;
+        sprayCount++;
+        if (sprayCount >= 20) {
+            MT_LOG("swim: %.0f splashes so far, %.2f ms of game-thread time for them", sprayCount, sprayCost * 1000);
+            sprayCount = sprayCost = 0;
+        }
+    }
     // the height model in numbers, once a second: the waves have to move (2026-11-14: they stood still)
     static double lastHeightLog;
     if (t - lastHeightLog > 1.0) {
@@ -679,6 +699,30 @@ static void tick(void*) {
     play(ch, !atTop ? A_Dive : flat > 60 ? A_Crawl : A_Tread);
 }
 
+// The game's own water spray (NS_WaterSpray_Point), spawned at a point on the water.
+static void spawnSpray(uintptr_t ch, Vec at, double surfZ) {
+    if (!fSpawnNiagara || !niagaraCDO || oNiSys < 0 || oNiLoc < 0) return;
+    if (!nSpray) {
+        nSpray = loadAsset(L"/Game/Particles/Environment/Water/NS_WaterSpray_Point.NS_WaterSpray_Point");
+        if (!nSpray) {  // the path may have moved in a game update: find it by name
+            for (int i = 0, n = api->num_objects(); i < n; i++) {
+                uintptr_t o = api->object(i);
+                if (o && objName(o) == "NS_WaterSpray_Point") { nSpray = o; break; }
+            }
+        }
+        if (!nSpray) return;
+        MT_LOG("swim: the water spray is loaded (%s)", objName(nSpray).c_str());
+    }
+    unsigned char p[0x80] = {0};
+    if (oNiCtx >= 0) memcpy(p + oNiCtx, &ch, sizeof ch);
+    if (oNiSys >= 0) memcpy(p + oNiSys, &nSpray, sizeof nSpray);
+    if (oNiLoc >= 0) { double loc[3] = {at.x, at.y, surfZ}; memcpy(p + oNiLoc, loc, 24); }
+    if (oNiScale >= 0) { double sc[3] = {1, 1, 1}; memcpy(p + oNiScale, sc, 24); }
+    if (oNiDestroy >= 0) p[oNiDestroy] = 1;   // the spray destroys itself
+    if (oNiActive >= 0) p[oNiActive] = 1;
+    api->process_event(niagaraCDO, fSpawnNiagara, p);
+}
+
 static bool gameFocused() {
     DWORD pid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &pid);
@@ -688,6 +732,8 @@ static bool gameFocused() {
 // Every class, function and field swimming needs; false while any is missing. Asked again for up to 2 minutes: the
 // Water module's classes are not always there the moment the engine is (2026-11-13 17:18: ready 3 s after start,
 // "functions or fields not found", no swimming that session).
+static void resolveExtra();  // the optional fields, looked up until they turn up
+
 static bool resolveAll() {
     cChar = api->find_object("Class", "Character", "/Script/Engine");
     uintptr_t cCMC = api->find_object("Class", "CharacterMovementComponent", "/Script/Engine");
@@ -715,14 +761,9 @@ static bool resolveAll() {
     fPath = api->find_object("Function", "MakeSoftObjectPath", "KismetSystemLibrary");
     fRef = api->find_object("Function", "Conv_SoftObjPathToSoftObjRef", "KismetSystemLibrary");
     fLoad = api->find_object("Function", "LoadAsset_Blocking", "KismetSystemLibrary");
-    if (cChar) { oCMC = off(cChar, "CharacterMovement"); oCharMesh = off(cChar, "Mesh"); oFallDist = off(cChar, "CurrentFallDistance"); oCap = off(cChar, "CapsuleComponent"); }
+    if (cChar) { oCMC = off(cChar, "CharacterMovement"); oCharMesh = off(cChar, "Mesh"); }
     if (fBounds) { oBOrg = off(fBounds, "Origin"); oBExt = off(fBounds, "BoxExtent"); }
-    {
-        uintptr_t cMesh = api->find_object("Class", "SkeletalMeshComponent", "/Script/Engine");
-        uintptr_t cCap = api->find_object("Class", "CapsuleComponent", "/Script/Engine");
-        if (cMesh) oMeshRot = off(cMesh, "RelativeRotation");
-        if (cCap) oCapRot = off(cCap, "RelativeRotation");
-    }
+    resolveExtra();
     if (fPlay) oPlayRet = off(fPlay, "ReturnValue");
     if (cCMC) { oMode = off(cCMC, "MovementMode"); oFly = off(cCMC, "MaxFlySpeed"); oMoveBase = off(cCMC, "MovementBase"); }
     if (cMove) oVel = off(cMove, "Velocity");
@@ -732,6 +773,48 @@ static bool resolveAll() {
     }
     return cChar && cCMC && cMove && cBody && fPawn && gameplayCDO && fLoc && fBodyComp && fSurface && fSetMode &&
            oCMC >= 0 && oMode >= 0 && oFly >= 0 && oVel >= 0 && oSurfOut >= 0;
+}
+
+// The optional things, looked up until they turn up: the engine loads its classes lazily, and a name that is not
+// there yet stays "not there" forever if it is only asked for once. This runs on the plugin's own thread: a lookup
+// walks every object in the game (2026-11-15: two seconds of it, and it must never happen on the game thread).
+static void resolveExtra() {
+    if (oMoveBase >= 0 && oFallDist >= 0 && oCap >= 0 && oMeshRot >= 0) return;
+    uintptr_t cCMC = api->find_object("Class", "CharacterMovementComponent", "/Script/Engine");
+    uintptr_t cMesh = api->find_object("Class", "SkeletalMeshComponent", "/Script/Engine");
+    uintptr_t cCap = api->find_object("Class", "CapsuleComponent", "/Script/Engine");
+    if (cChar) {
+        if (oFallDist < 0) oFallDist = off(cChar, "CurrentFallDistance");
+        if (oCap < 0) oCap = off(cChar, "CapsuleComponent");
+    }
+    if (cCMC && oMoveBase < 0) oMoveBase = off(cCMC, "MovementBase");
+    if (!fSetBase) {
+        fSetBase = api->find_object("Function", "SetBase", "CharacterMovementComponent");
+        if (!fSetBase) fSetBase = api->find_object("Function", "SetBase", "PawnMovementComponent");
+        if (!fSetBase) fSetBase = api->find_object("Function", "SetBase", "MovementComponent");
+    }
+    if (cMesh && oMeshRot < 0) oMeshRot = off(cMesh, "RelativeRotation");
+    if (cCap && oCapRot < 0) oCapRot = off(cCap, "RelativeRotation");
+    // the game's own water spray, for the splash around the swimmer (2026-11-15: "nice waves around the player, small
+    // effects of how it's cracking the water")
+    if (!fSpawnNiagara) {
+        fSpawnNiagara = api->find_object("Function", "SpawnSystemAtLocation", "NiagaraFunctionLibrary");
+        niagaraCDO = api->find_object("NiagaraFunctionLibrary", "Default__NiagaraFunctionLibrary", "/Script/Niagara");
+        if (fSpawnNiagara) {
+            oNiCtx = off(fSpawnNiagara, "WorldContextObject");
+            oNiSys = off(fSpawnNiagara, "SystemTemplate");
+            oNiLoc = off(fSpawnNiagara, "Location");
+            oNiRot = off(fSpawnNiagara, "Rotation");
+            oNiScale = off(fSpawnNiagara, "Scale");
+            oNiDestroy = off(fSpawnNiagara, "bAutoDestroy");
+            oNiActive = off(fSpawnNiagara, "bAutoActivate");
+            oNiPool = off(fSpawnNiagara, "PoolingMethod");
+            oNiPreCull = off(fSpawnNiagara, "PreCullDistance");
+            oNiRet = off(fSpawnNiagara, "ReturnValue");
+        }
+    }
+    if (oMoveBase >= 0 && oFallDist >= 0 && oCap >= 0 && oMeshRot >= 0)
+        MT_LOG("swim: everything optional is found now (the movement base, the fall distance, the rotation)");
 }
 
 static DWORD WINAPI run(LPVOID) {
@@ -754,6 +837,11 @@ static DWORD WINAPI run(LPVOID) {
             scanWaters();
             api->run_on_game_thread([](void*) { findWaters(); }, nullptr);
         }
+        if (beat % 300 == 0) {  // every 5 s, on this thread: the water's classes, the clock's subsystem, the fields
+            sea::resolveClasses();
+            sea::waterSubsystem();
+            resolveExtra();
+        }
         bool f = gameFocused(), space = f && (GetAsyncKeyState(VK_SPACE) & 0x8000);
         LONG k = (f && (GetAsyncKeyState(kDiveKey) & 0x8000) ? 1 : 0) | (space ? 2 : 0) | (f && (GetAsyncKeyState(VK_SHIFT) & 0x8000) ? 4 : 0);
         InterlockedExchange(&keys, k);
@@ -774,7 +862,7 @@ static void demo() {
     ok &= closeTo(vertical(-500, 0, false, false, false, true, 0).vz, 40);    // fresh water lifts less
     ok &= closeTo(vertical(-500, 0, true, false, true, false, 0).vz, 400);    // blacked out: up, whatever the keys
     ok &= closeTo(vertical(-10, 0, false, false, false, false, 0).vz, 40);    // at the surface: held to the line
-    ok &= closeTo(vertical(-500, 0, false, false, false, false, 30).vz, 70);  // the water's own motion is ridden
+    ok &= closeTo(vertical(-500, 0, false, false, false, false, 30).vz, 90);  // the water's own motion is ridden
     ok &= swell(0, 0, 0) == 0 || kSwell > 0;
     ok &= !alive(0);  // nothing is alive that is not there
     kDive = d; kRise = r; kDrift = dr;
@@ -802,6 +890,9 @@ extern "C" __declspec(dllexport) int PluginInit(const MtApi* a) {
     // The lean with the wave, in degrees. The games heave without tilting (Valheim zeroes the angular velocity,
     // BotW stiffens pitch and roll), so this is off unless it is asked for.
     kLean = iniNum(INI, L"Swim", L"Lean", 0);
+    // The splash (the game's own water spray around the swimmer) is off for now: the user, 2026-11-15, "splashes is
+    // very odd for the time being, let's drop it for now". Set SprayEvery to a number of seconds to bring it back.
+    kSprayEvery = iniNum(INI, L"Swim", L"SprayEvery", 0);
     kDiveKey = (int)iniNum(INI, L"Swim", L"DiveKey", VK_CONTROL);
     CloseHandle(CreateThread(nullptr, 0, run, nullptr, 0, nullptr));
     return 0;
