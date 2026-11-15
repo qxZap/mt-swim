@@ -1,3 +1,6 @@
+> **Merged into [mt-sea](https://github.com/qxZap/mt-sea) (2026-11-15).** The Swim and Boats plugins are one
+> plugin now -- one sea state, one scan, one DLL. This repository is kept as the history of the swim half.
+
 # Swim
 
 Swimming on foot.
